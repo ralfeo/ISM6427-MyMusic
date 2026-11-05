@@ -207,6 +207,10 @@ async function onGenerate(e) {
       label: body.customMode ? body.title || body.style || "Custom song" : body.prompt || body.style,
       detail: [body.model.replace("_", " "), body.instrumental ? "Instrumental" : "Vocals", body.customMode ? "Custom" : "Simple"].join(" · "),
       status: "PENDING",
+      // Kept as fallbacks: Suno sometimes leaves these blank on the 2nd track.
+      title: body.title || "",
+      lyrics: body.customMode && !body.instrumental ? body.lyrics || "" : "",
+      style: body.style || "",
       tracks: [],
     };
     jobs.unshift(job);
@@ -265,14 +269,50 @@ function extractTracks(info) {
     .filter((t) => t && (t.audio_url || t.stream_audio_url || t.audioUrl || t.streamAudioUrl))
     .map((t) => ({
       id: t.id,
-      title: t.title || "Untitled",
+      title: (t.title || "").trim(),
       tags: t.tags || "",
       image: t.image_url || t.imageUrl || "",
       audio: t.audio_url || t.audioUrl || "",
       stream: t.stream_audio_url || t.streamAudioUrl || "",
       duration: t.duration || 0,
-      lyrics: t.prompt || "",
+      lyrics: (t.prompt || t.lyrics || t.lyric || "").trim(),
     }));
+}
+
+// Suno returns two takes per request, but often only the first carries the
+// title / lyrics (especially before the task is fully complete). Merge each
+// poll with what we already know, then borrow from the sibling take and
+// finally from what the user submitted.
+function mergeTracks(job, fresh, info) {
+  const prev = new Map((job.tracks || []).map((t) => [t.id, t]));
+  const merged = fresh.map((t) => {
+    const old = prev.get(t.id) || {};
+    const out = { ...old };
+    for (const [k, v] of Object.entries(t)) if (v) out[k] = v;
+    return out;
+  });
+  let param = {};
+  try {
+    param = typeof info?.param === "string" ? JSON.parse(info.param) : info?.param || {};
+  } catch { /* ignore */ }
+  if (!job.title && param.title) job.title = param.title;
+  if (!job.lyrics && param.customMode && !param.instrumental) job.lyrics = param.lyrics || param.prompt || "";
+  return fillTracks(job, merged);
+}
+
+function fillTracks(job, tracks) {
+  const isBlankTitle = (s) => !s || s === "Untitled";
+  const shared = {
+    title: tracks.map((t) => t.title).find((s) => !isBlankTitle(s)) || job.title || "",
+    lyrics: tracks.map((t) => t.lyrics).find(Boolean) || job.lyrics || "",
+    tags: tracks.map((t) => t.tags).find(Boolean) || job.style || "",
+  };
+  return tracks.map((t) => ({
+    ...t,
+    title: isBlankTitle(t.title) ? shared.title : t.title,
+    lyrics: t.lyrics || shared.lyrics,
+    tags: t.tags || shared.tags,
+  }));
 }
 
 function poll(taskId) {
@@ -283,7 +323,7 @@ function poll(taskId) {
     try {
       const info = await api(`/api/status?taskId=${encodeURIComponent(taskId)}`);
       const tracks = extractTracks(info);
-      if (tracks.length) job.tracks = tracks;
+      if (tracks.length) job.tracks = mergeTracks(job, tracks, info);
       job.status = info?.status || job.status;
       if (FAILED.has(job.status)) job.error = info.errorMessage || STATUS_LABEL[job.status];
     } catch (err) {
@@ -367,24 +407,28 @@ function buildJob(job) {
     p.textContent = job.error || "Generation failed. Try rephrasing your description.";
     tracks.append(p);
   }
-  job.tracks.forEach((t) => tracks.append(buildTrack(t)));
+  const list = fillTracks(job, job.tracks || []);
+  list.forEach((t, i) => tracks.append(buildTrack(t, list.length > 1 ? i + 1 : 0, job)));
   return el;
 }
 
-function buildTrack(t) {
+function buildTrack(t, version = 0, job = {}) {
   const el = $("#trackTpl").content.firstElementChild.cloneNode(true);
   el.dataset.id = t.id;
   const img = $("img", el);
   if (t.image) img.src = t.image;
   else img.remove();
-  $(".t-title", el).textContent = t.title;
+  const title = t.title || (job.label ? job.label.slice(0, 60) : "") || "Untitled";
+  t = { ...t, title };
+  $(".t-title", el).textContent = title;
   $(".t-tags", el).textContent = t.tags;
-  $(".t-dur", el).textContent = t.audio ? fmtTime(t.duration) : "Streaming preview · final file coming";
+  const v = version ? `Version ${version} · ` : "";
+  $(".t-dur", el).textContent = v + (t.audio ? fmtTime(t.duration) : "Streaming preview · final file coming");
 
   const dl = $(".download", el);
   if (t.audio) {
     dl.href = t.audio;
-    dl.setAttribute("download", `${t.title}.mp3`);
+    dl.setAttribute("download", `${title}${version ? ` (v${version})` : ""}.mp3`);
   } else {
     dl.setAttribute("aria-disabled", "true");
   }
