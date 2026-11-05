@@ -1,4 +1,5 @@
 import { json, checkAccess, callbackUrl, suno, relay } from "../lib/suno.mjs";
+import { store, sha256 } from "../lib/songs.mjs";
 
 const MODELS = new Set(["V6", "V6_WILD", "V6_MINI"]);
 const clip = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "");
@@ -58,7 +59,30 @@ export default async (req) => {
     if (weirdness !== undefined) body.weirdnessConstraint = Math.round(weirdness * 100) / 100;
   }
 
-  return relay(await suno("/api/v1/generate", { method: "POST", body }));
+  const result = await suno("/api/v1/generate", { method: "POST", body });
+  const taskId = result?.data?.taskId;
+  if (Number(result?.code) !== 200 || !taskId) return relay(result);
+
+  // Save to the shared library right away; /api/status and /api/callback
+  // fill in the tracks as Suno finishes them.
+  const ownerToken = crypto.randomUUID();
+  try {
+    await store().setJSON(String(taskId), {
+      taskId: String(taskId),
+      createdAt: Date.now(),
+      label: (customMode ? body.title || body.style || "Custom song" : body.prompt || body.style || "").slice(0, 200),
+      detail: [model.replace("_", " "), instrumental ? "Instrumental" : "Vocals", customMode ? "Custom" : "Simple"].join(" · "),
+      title: body.title || "",
+      lyrics: body.lyrics || "",
+      style: (body.style || "").slice(0, 300),
+      status: "PENDING",
+      tracks: [],
+      ownerHash: await sha256(ownerToken),
+    });
+  } catch (err) {
+    console.error("Could not save song to library", err);
+  }
+  return relay({ ...result, data: { ...result.data, ownerToken } });
 };
 
 export const config = { path: "/api/generate" };

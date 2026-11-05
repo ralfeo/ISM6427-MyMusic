@@ -39,8 +39,10 @@ const IDEAS = [
 const STYLES = ["pop", "hip hop", "lo-fi", "rock", "EDM", "jazz", "R&B", "country", "cinematic", "synthwave", "acoustic", "latin"];
 
 let mode = "simple";
-let jobs = loadJobs();
+let jobs = loadJobs(); // songs made in this browser (keeps the owner token)
+let shared = []; // the shared library everyone sees
 const timers = new Map();
+const LIBRARY_REFRESH_MS = 30000;
 
 /* ---------------- API ---------------- */
 
@@ -212,6 +214,8 @@ async function onGenerate(e) {
       lyrics: body.customMode && !body.instrumental ? body.lyrics || "" : "",
       style: body.style || "",
       tracks: [],
+      ownerToken: data.ownerToken || "",
+      published: true,
     };
     jobs.unshift(job);
     saveJobs();
@@ -345,7 +349,10 @@ function poll(taskId) {
       timers.set(taskId, setTimeout(tick, POLL_MS));
     } else {
       timers.delete(taskId);
-      if (job.status === "SUCCESS") refreshCredits();
+      if (job.status === "SUCCESS") {
+        refreshCredits();
+        loadLibrary();
+      }
     }
   };
   timers.set(taskId, setTimeout(tick, 2500));
@@ -366,17 +373,122 @@ const ago = (t) => {
   return new Date(t).toLocaleDateString();
 };
 
+// Shared songs plus anything of ours that's still in progress (or failed,
+// which only the creator sees). Our local copy wins while it's in progress.
+function allSongs() {
+  const byId = new Map();
+  for (const s of shared) byId.set(s.taskId, { ...s, mine: false });
+  for (const j of jobs) {
+    const s = byId.get(j.taskId);
+    const sharedDone = s && s.tracks?.length && s.tracks.every((t) => t.audio);
+    const localDone = j.tracks?.length && j.tracks.every((t) => t.audio);
+    byId.set(j.taskId, s && sharedDone && !localDone ? { ...s, ownerToken: j.ownerToken, mine: true } : { ...j, mine: true });
+  }
+  return [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+}
+
 function render() {
-  const box = $("#jobs");
-  box.replaceChildren(...jobs.map(buildJob));
-  $("#empty").hidden = jobs.length > 0;
-  $("#clearBtn").hidden = jobs.length === 0;
+  const list = allSongs();
+  $("#jobs").replaceChildren(...list.map(buildJob));
+  $("#empty").hidden = list.length > 0;
+  highlightShared();
+}
+
+async function loadLibrary() {
+  try {
+    const data = await api("/api/songs");
+    if (Array.isArray(data)) {
+      const sig = JSON.stringify(data);
+      if (sig !== loadLibrary.last) {
+        loadLibrary.last = sig;
+        shared = data;
+        render();
+      }
+    }
+    publishOldSongs();
+  } catch (err) {
+    console.warn("Library unavailable:", err.message);
+  }
+}
+
+// Songs made before the shared library existed only lived in this browser.
+// Ask the server to publish them (it re-checks each one with Suno).
+async function publishOldSongs() {
+  const ids = new Set(shared.map((s) => s.taskId));
+  let changed = false;
+  for (const j of jobs) {
+    if (j.published || j.status !== "SUCCESS" || ids.has(j.taskId)) continue;
+    j.published = true;
+    changed = true;
+    try {
+      const rec = await api("/api/songs", {
+        method: "POST",
+        body: JSON.stringify({ taskId: j.taskId, createdAt: j.createdAt, label: j.label, detail: j.detail, title: j.title, style: j.style }),
+      });
+      if (rec?.ownerToken) j.ownerToken = rec.ownerToken;
+      if (rec?.taskId && !shared.some((s) => s.taskId === rec.taskId)) shared.push(rec);
+    } catch { /* not found or offline — stays private to this browser */ }
+    saveJobs();
+  }
+  if (changed) render();
+}
+
+async function removeSong(job) {
+  if (!confirm("Remove this song for everyone?")) return;
+  clearTimeout(timers.get(job.taskId));
+  // Always tell the server when we own it — our copy of the library may be
+  // a few seconds behind and not list this song yet.
+  const isShared = shared.some((s) => s.taskId === job.taskId);
+  if (isShared || job.ownerToken) {
+    try {
+      await api("/api/songs", { method: "DELETE", body: JSON.stringify({ taskId: job.taskId, token: job.ownerToken || "" }) });
+    } catch (err) {
+      return alert(err.message);
+    }
+  }
+  shared = shared.filter((s) => s.taskId !== job.taskId);
+  jobs = jobs.filter((j) => j.taskId !== job.taskId);
+  saveJobs();
+  render();
+}
+
+function shareLink(taskId) {
+  const url = new URL(location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("song", taskId);
+  return url.toString();
+}
+
+async function copyShare(btn, taskId) {
+  const link = shareLink(taskId);
+  try {
+    if (navigator.share && matchMedia("(pointer: coarse)").matches) {
+      await navigator.share({ title: "Listen to my song", url: link });
+      return;
+    }
+    await navigator.clipboard.writeText(link);
+    btn.textContent = "✓";
+  } catch {
+    prompt("Copy this link:", link);
+  }
+  setTimeout(() => (btn.textContent = "🔗"), 1500);
+}
+
+function highlightShared() {
+  const id = new URLSearchParams(location.search).get("song");
+  if (!id || highlightShared.done) return;
+  const el = $(`.job[data-task="${CSS.escape(id)}"]`);
+  if (!el) return;
+  highlightShared.done = true;
+  el.classList.add("highlight");
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function renderJob(job) {
   const old = $(`.job[data-task="${CSS.escape(job.taskId)}"]`);
   if (!old) return render();
-  old.replaceWith(buildJob(job));
+  old.replaceWith(buildJob({ ...job, mine: true }));
 }
 
 function buildJob(job) {
@@ -393,12 +505,16 @@ function buildJob(job) {
   status.classList.toggle("failed", failed);
   el.classList.toggle("finished", done || failed || job.status === "PAUSED");
 
-  $(".remove", el).onclick = () => {
-    clearTimeout(timers.get(job.taskId));
-    jobs = jobs.filter((j) => j.taskId !== job.taskId);
-    saveJobs();
-    render();
-  };
+  const share = $(".share", el);
+  if (job.tracks?.length && !failed) share.onclick = () => copyShare(share, job.taskId);
+  else share.remove();
+
+  // Only the creator (or the site owner with APP_PASSWORD) can remove a song.
+  const isShared = shared.some((s) => s.taskId === job.taskId);
+  const canRemove = job.ownerToken || (job.mine && !isShared) || localStorage.getItem(PW_KEY);
+  if (canRemove) $(".remove", el).onclick = () => removeSong(job);
+  else $(".remove", el).remove();
+  if (job.mine) $(".job-sub", el).textContent += " · made by you";
 
   const tracks = $(".tracks", el);
   if (failed) {
@@ -507,14 +623,6 @@ function init() {
       $(`#${out}`).textContent = Number(e.target.value).toFixed(2);
     });
   });
-  $("#clearBtn").onclick = () => {
-    if (!confirm("Remove all tracks from this list? (Downloaded files are not affected.)")) return;
-    timers.forEach(clearTimeout);
-    timers.clear();
-    jobs = [];
-    saveJobs();
-    render();
-  };
   $("#appPassword").addEventListener("change", (e) => {
     const pw = e.target.value.trim();
     if (!pw) return;
@@ -532,6 +640,8 @@ function init() {
   setMode("simple");
   render();
   refreshCredits();
+  loadLibrary();
+  setInterval(() => document.visibilityState === "visible" && loadLibrary(), LIBRARY_REFRESH_MS);
   // Resume any unfinished jobs from a previous visit.
   jobs.filter((j) => !(j.status === "SUCCESS" || FAILED.has(j.status))).forEach((j) => poll(j.taskId));
 }
